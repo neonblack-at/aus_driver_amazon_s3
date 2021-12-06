@@ -17,23 +17,26 @@ use AUS\AusDriverAmazonS3\S3Adapter\MetaInfoDownloadAdapter;
 use AUS\AusDriverAmazonS3\S3Adapter\MultipartUploaderAdapter;
 use Aws\S3\S3Client;
 use Aws\S3\StreamWrapper;
+use Psr\Http\Message\ResponseInterface;
 use TYPO3\CMS\Core\Charset\CharsetConverter;
 use TYPO3\CMS\Core\Configuration\ExtensionConfiguration;
 use TYPO3\CMS\Core\Core\Environment;
+use TYPO3\CMS\Core\Http\Response;
 use TYPO3\CMS\Core\Log\LogLevel;
 use TYPO3\CMS\Core\Log\LogManager;
 use TYPO3\CMS\Core\Messaging\FlashMessage;
 use TYPO3\CMS\Core\Messaging\FlashMessageService;
+use TYPO3\CMS\Core\Resource\Driver\AbstractHierarchicalFilesystemDriver;
+use TYPO3\CMS\Core\Resource\Driver\StreamableDriverInterface;
+use TYPO3\CMS\Core\Resource\Exception;
 use TYPO3\CMS\Core\Resource\FileInterface;
 use TYPO3\CMS\Core\Resource\Folder;
+use TYPO3\CMS\Core\Resource\ResourceStorage;
 use TYPO3\CMS\Core\Resource\ResourceStorageInterface;
 use TYPO3\CMS\Core\Resource\StorageRepository;
 use TYPO3\CMS\Core\Utility\ExtensionManagementUtility;
 use TYPO3\CMS\Core\Utility\GeneralUtility;
 use TYPO3\CMS\Core\Utility\PathUtility;
-use TYPO3\CMS\Core\Resource\Driver\AbstractHierarchicalFilesystemDriver;
-use TYPO3\CMS\Core\Resource\Exception;
-use TYPO3\CMS\Core\Resource\ResourceStorage;
 use TYPO3\CMS\Core\Utility\VersionNumberUtility;
 use TYPO3\CMS\Extbase\Object\ObjectManager;
 use TYPO3\CMS\Extbase\SignalSlot\Dispatcher;
@@ -46,7 +49,7 @@ use TYPO3\CMS\Extbase\Utility\LocalizationUtility;
  * @author Markus Hölzle <typo3@markus-hoelzle.de>
  * @package AUS\AusDriverAmazonS3\Driver
  */
-class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
+class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver implements StreamableDriverInterface
 {
     const DRIVER_TYPE = 'AusDriverAmazonS3';
 
@@ -344,7 +347,7 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
      */
     public function folderExistsInFolder($folderName, $folderIdentifier)
     {
-        return $this->prefixExists($folderIdentifier . $folderName . '/');
+        return $this->prefixExists(rtrim($folderIdentifier, '/') . '/' . $folderName . '/');
     }
 
     /**
@@ -483,7 +486,7 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
     {
         if ($deleteRecursively) {
             $items = $this->getListObjects($folderIdentifier);
-            foreach ($items['Contents'] as $object) {
+            foreach ($items['Contents'] ?? [] as $object) {
                 // Filter the folder itself
                 if ($object['Key'] !== $folderIdentifier) {
                     if ($this->isDir($object['Key'])) {
@@ -747,7 +750,7 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
         );
 
         // Contents will always include the folder itself
-        if (sizeof($result['Contents']) > 1) {
+        if (isset($result['Contents']) && sizeof($result['Contents']) > 1) {
             return false;
         }
         return true;
@@ -1021,8 +1024,36 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
         return $this->storageUid;
     }
 
-
-
+    /**
+     * Stream file using a PSR-7 Response object.
+     *
+     * @param string $identifier
+     * @param array $properties
+     * @return ResponseInterface
+     */
+    public function streamFile(string $identifier, array $properties): ResponseInterface
+    {
+        $fileInfo = $this->getFileInfoByIdentifier($identifier, ['name', 'mimetype', 'mtime', 'size']);
+        $downloadName = $properties['filename_overwrite'] ?? $fileInfo['name'] ?? '';
+        $mimeType = $properties['mimetype_overwrite'] ?? $fileInfo['mimetype'] ?? '';
+        $contentDisposition = ($properties['as_download'] ?? false) ? 'attachment' : 'inline';
+        $stream = new \TYPO3\CMS\Core\Http\Stream('php://temp', 'rw');
+        $stream->write($this->getFileContents($identifier));
+        $stream->rewind();
+        return new Response(
+            $stream,
+            200,
+            [
+                'Content-Disposition' => $contentDisposition . '; filename="' . $downloadName . '"',
+                'Content-Type' => $mimeType,
+                'Content-Length' => (string)$fileInfo['size'],
+                'Last-Modified' => gmdate('D, d M Y H:i:s', $fileInfo['mtime']) . ' GMT',
+                // Cache-Control header is needed here to solve an issue with browser IE8 and lower
+                // See for more information: http://support.microsoft.com/kb/323308
+                'Cache-Control' => '',
+            ]
+        );
+    }
 
 
     /*************************************************************
@@ -1112,6 +1143,12 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
         if (!empty($this->configuration['signature'])) {
             $configuration['signature_version'] = $this->configuration['signature_version'];
         }
+        if (!empty($this->configuration['customHost'])) {
+            $configuration['endpoint'] = $this->configuration['customHost'];
+        }
+        if (!empty($this->configuration['pathStyleEndpoint'])) {
+            $configuration['use_path_style_endpoint'] = true;
+        }
 
         if (
             isset($GLOBALS['TYPO3_CONF_VARS']['EXTCONF'][self::EXTENSION_KEY]['initializeClient-preProcessing']) &&
@@ -1193,11 +1230,16 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
      */
     protected function prefixExists(string $identifier): bool
     {
-        if ($this->objectExists($identifier)) {
+        $objects = $this->getListObjects($identifier, ['MaxKeys' => 1]);
+        if (is_array($objects['Contents']) && count($objects['Contents']) > 0) {
             return true;
         }
-        $objects = $this->getListObjects($identifier, ['MaxKeys' => 1]);
-        return is_array($objects['Contents']) ? count($objects['Contents']) > 0 : false;
+
+        //Do the HEAD call to work around MinIO speciality/bug:
+        //- empty directories do not appear in ListObjectsV2 call
+        //- empty directories appear in HEAD call
+        //Since empty directories are the exception, we try the HEAD call last
+        return $this->objectExists($identifier);
     }
 
     /**
@@ -1343,7 +1385,7 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
      * @param string $body
      * @param array $overrideArgs
      */
-    protected function createObject($identifier, $body = ' ', $overrideArgs = [])
+    protected function createObject($identifier, $body = '', $overrideArgs = [])
     {
         $this->normalizeIdentifier($identifier);
         $args = [
@@ -1511,6 +1553,10 @@ class AmazonS3Driver extends AbstractHierarchicalFilesystemDriver
                     $this->metaInfoCache[$fileIdentifier] = $metaInfoDownloadAdapter->getMetaInfoFromResponse($this, $fileIdentifier, $content);
                 }
             }
+        }
+
+        if (isset($overrideArgs['MaxKeys']) && $overrideArgs['MaxKeys'] <= 1000) {
+            return $result;
         }
 
         // Amazon S3 lists max 1000 files, so we have to get all recursive
